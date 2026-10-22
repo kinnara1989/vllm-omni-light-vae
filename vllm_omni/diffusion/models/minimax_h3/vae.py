@@ -1321,9 +1321,7 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
                             if _m.bias is not None:
                                 _m.bias.data = _m.bias.data.to(torch.float16)
                             _n += 1
-                logger.info(
-                    "MiniMax-H3 light VAE: materialized %d decoder-block Linear weights in fp16", _n
-                )
+                logger.info("MiniMax-H3 light VAE: materialized %d decoder-block Linear weights in fp16", _n)
         _attn_backend = os.environ.get("MINIMAX_H3_LIGHT_VAE_ATTN", "off").strip().lower()
         if _attn_backend and _attn_backend not in ("off", "none", "0", "native"):
             try:
@@ -1342,9 +1340,7 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
             self._stager = PinnedModuleStager(model, device, pin_memory=True)
         self.use_tiling = True
         try:
-            self._light_settings = json.loads(
-                (Path(component_path) / "decode_config.json").read_text()
-            )
+            self._light_settings = json.loads((Path(component_path) / "decode_config.json").read_text())
         except Exception:
             self._light_settings = {}
         _tile_env = os.environ.get("MINIMAX_H3_LIGHT_VAE_TILE", "").strip().lower()
@@ -1465,12 +1461,10 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
         # avoid repeatedly copying complete rows and videos through torch.cat.
         sample = tiles[0][0]
         row_heights = [
-            row[0].shape[-2] - (height_overlaps[i] if i < len(tiles) - 1 else 0)
-            for i, row in enumerate(tiles)
+            row[0].shape[-2] - (height_overlaps[i] if i < len(tiles) - 1 else 0) for i, row in enumerate(tiles)
         ]
         column_widths = [
-            tile.shape[-1] - (width_overlaps[j] if j < len(tiles[0]) - 1 else 0)
-            for j, tile in enumerate(tiles[0])
+            tile.shape[-1] - (width_overlaps[j] if j < len(tiles[0]) - 1 else 0) for j, tile in enumerate(tiles[0])
         ]
         canvas = sample.new_empty((*sample.shape[:-2], sum(row_heights), sum(column_widths)))
         out_y = 0
@@ -1482,9 +1476,9 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
                 if j and width_overlaps[j - 1] > 0:
                     tile = self.model._blend(row[j - 1], tile, width_overlaps[j - 1], dim=-1)
                 if i < len(tiles) - 1 and height_overlaps[i] > 0:
-                    tile = tile[..., :-height_overlaps[i], :]
+                    tile = tile[..., : -height_overlaps[i], :]
                 if j < len(row) - 1 and width_overlaps[j] > 0:
-                    tile = tile[..., :, :-width_overlaps[j]]
+                    tile = tile[..., :, : -width_overlaps[j]]
                 canvas[..., out_y : out_y + tile.shape[-2], out_x : out_x + tile.shape[-1]].copy_(tile)
                 out_x += tile.shape[-1]
             out_y += row_heights[i]
@@ -1494,16 +1488,17 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
         size = dist.get_world_size(group)
         counts = [len(range(r, n, size)) for r in range(size)]
         maxc = max(counts)
-        if dec.shape[0] != counts[dist.get_rank(group)]:
-            raise RuntimeError(
-                f"local Light VAE tile count changed: got {dec.shape[0]}, expected {counts[dist.get_rank(group)]}"
-            )
-        if dec.shape[0] < maxc:
-            pad = dec.new_zeros((maxc - dec.shape[0],) + tuple(dec.shape[1:]))
-            dec = torch.cat([dec, pad], dim=0)
-        dec = dec.contiguous()
-        storage = torch.empty((size, *dec.shape), device=dec.device, dtype=dec.dtype)
-        buffers = [storage[r] for r in range(size)]
+        with self.distributed_executor.sync_errors("light VAE tile gather allocation"):
+            if dec.shape[0] != counts[dist.get_rank(group)]:
+                raise RuntimeError(
+                    f"local Light VAE tile count changed: got {dec.shape[0]}, expected {counts[dist.get_rank(group)]}"
+                )
+            if dec.shape[0] < maxc:
+                pad = dec.new_zeros((maxc - dec.shape[0],) + tuple(dec.shape[1:]))
+                dec = torch.cat([dec, pad], dim=0)
+            dec = dec.contiguous()
+            storage = torch.empty((size, *dec.shape), device=dec.device, dtype=dec.dtype)
+            buffers = [storage[r] for r in range(size)]
         dist.all_gather(buffers, dec, group=group)
         out = [None] * n
         for r in range(size):
@@ -1521,6 +1516,11 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
             return max(1, int(os.environ.get("MINIMAX_H3_LIGHT_VAE_WINDOW_BATCH", "6")))
         except Exception:
             return 6
+
+    def _sync_decode_errors(self, stage: str, distributed: bool):
+        if not distributed:
+            return nullcontext()
+        return self.distributed_executor.sync_errors(stage)
 
     def _temporal_plan(self, latent_t: int):
         m = self.model
@@ -1567,13 +1567,14 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
     def _gather_window_clips(self, local_clips, tasks, assigned, size, rank, group, n, w_count):
         counts = [len(assigned[r]) for r in range(size)]
         maxc = max(counts)
-        local = torch.cat(local_clips, dim=0) if len(local_clips) > 1 else local_clips[0]
-        if local.shape[0] < maxc:
-            pad = local.new_zeros((maxc - local.shape[0],) + tuple(local.shape[1:]))
-            local = torch.cat([local, pad], dim=0)
-        local = local.contiguous()
-        storage = torch.empty((size, *local.shape), device=local.device, dtype=local.dtype)
-        buffers = [storage[r] for r in range(size)]
+        with self.distributed_executor.sync_errors("light VAE window gather allocation"):
+            local = torch.cat(local_clips, dim=0) if len(local_clips) > 1 else local_clips[0]
+            if local.shape[0] < maxc:
+                pad = local.new_zeros((maxc - local.shape[0],) + tuple(local.shape[1:]))
+                local = torch.cat([local, pad], dim=0)
+            local = local.contiguous()
+            storage = torch.empty((size, *local.shape), device=local.device, dtype=local.dtype)
+            buffers = [storage[r] for r in range(size)]
         dist.all_gather(buffers, local, group=group)
         out = [None] * len(tasks)
         for r in range(size):
@@ -1609,8 +1610,7 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
             intra = plan["intra_tail"]
             num_tokens_before_pad = plan["T"]
             pad_frames = sum(
-                intra if intra and (num_tokens_before_pad + k) % tcs == 0 else tratio
-                for k in range(plan["pad_tokens"])
+                intra if intra and (num_tokens_before_pad + k) % tcs == 0 else tratio for k in range(plan["pad_tokens"])
             )
             out = out[:, :, :-pad_frames]
         return out
@@ -1640,16 +1640,15 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
         m.use_tiling = False
         local_clips = []
         try:
-            pos = 0
-            for start in range(0, len(mine), cap):
-                batch = mine[start : start + cap]
-                packed = torch.cat(
-                    [self._window_latent(zpad, ranges, t, w, plan) for (t, w) in batch], dim=0
-                )
-                out = m._decode_clip(packed.to(dtype=dtype))
-                for k in range(out.shape[0]):
-                    local_clips.append(out[k : k + 1])
-                    pos += 1
+            with self._sync_decode_errors("light VAE window decode", True):
+                pos = 0
+                for start in range(0, len(mine), cap):
+                    batch = mine[start : start + cap]
+                    packed = torch.cat([self._window_latent(zpad, ranges, t, w, plan) for (t, w) in batch], dim=0)
+                    out = m._decode_clip(packed.to(dtype=dtype))
+                    for k in range(out.shape[0]):
+                        local_clips.append(out[k : k + 1])
+                        pos += 1
         finally:
             m.use_tiling = prev
         decoder_done = self._profile_stamp(profile)
@@ -1686,10 +1685,7 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
         # distributed layer-wise offload backend, and the pinned stager's
         # device binding can go stale when weights are re-materialized after
         # construction. Trust the real tensor device and stage before decoding.
-        if (
-            self._device_target.type != "cpu"
-            and next(m.decoder.parameters()).device != self._device_target
-        ):
+        if self._device_target.type != "cpu" and next(m.decoder.parameters()).device != self._device_target:
             m.to(self._device_target)
         ratio = int(m.spatial_compression_ratio)
         height = int(z.shape[-2]) * ratio
@@ -1709,39 +1705,30 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
             size = dist.get_world_size(group)
             rank = dist.get_rank(group)
         distributed = group is not None and size > 1 and n >= size
-        if (
-            distributed
-            and self._window_balance_enabled()
-            and int(z.shape[2]) >= m.tokens_chunk_size + m.token_overlap
-        ):
-            balanced = self._decode_video_balanced(
-                z, ys, hs, y_ov, xs, ws, x_ov, group, size, rank, profile, started
-            )
+        if distributed and self._window_balance_enabled() and int(z.shape[2]) >= m.tokens_chunk_size + m.token_overlap:
+            balanced = self._decode_video_balanced(z, ys, hs, y_ov, xs, ws, x_ov, group, size, rank, profile, started)
             if balanced is not None:
                 return balanced
         local = list(range(rank, n, size)) if distributed else list(range(n))
         packed = torch.cat([tiles[i] for i in local], dim=0)
         single = packed.shape[2] == 1
         if single:
-            packed = packed.expand(
-                -1, -1, int(self._light_settings["image_context_tokens"]), -1, -1
-            ).contiguous()
+            packed = packed.expand(-1, -1, int(self._light_settings["image_context_tokens"]), -1, -1).contiguous()
         dtype = next(m.decoder.parameters()).dtype
         packed = packed.to(dtype=dtype)
         packed_done = self._profile_stamp(profile)
         prev = m.use_tiling
         m.use_tiling = False  # tiles are pre-cut; avoid a second spatial split
         try:
-            if packed.shape[2] < m.tokens_chunk_size + m.token_overlap:
-                dec = m._decode_clip(packed)
-                start = (
-                    int(self._light_settings["image_context_output_phase"])
-                    if single
-                    else int(m.frame_pre_padding)
-                )
-                dec = dec[:, :, start : start + 1] if single else dec[:, :, start:]
-            else:
-                dec = m._decode(packed)
+            with self._sync_decode_errors("light VAE tile decode", distributed):
+                if packed.shape[2] < m.tokens_chunk_size + m.token_overlap:
+                    dec = m._decode_clip(packed)
+                    start = (
+                        int(self._light_settings["image_context_output_phase"]) if single else int(m.frame_pre_padding)
+                    )
+                    dec = dec[:, :, start : start + 1] if single else dec[:, :, start:]
+                else:
+                    dec = m._decode(packed)
         finally:
             m.use_tiling = prev
         decoder_done = self._profile_stamp(profile)
@@ -1813,8 +1800,8 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
         if self._resident:
             try:
                 rank = dist.get_rank() if dist.is_initialized() else 0
-                peak_alloc = torch.accelerator.max_memory_allocated(self._device_target) / (1024 ** 3)
-                reserved = torch.accelerator.memory_reserved(self._device_target) / (1024 ** 3)
+                peak_alloc = torch.accelerator.max_memory_allocated(self._device_target) / (1024**3)
+                reserved = torch.accelerator.memory_reserved(self._device_target) / (1024**3)
                 logger.info(
                     "[LightVAEHBM] rank=%d peak_alloc_gib=%.2f reserved_gib=%.2f",
                     rank,
