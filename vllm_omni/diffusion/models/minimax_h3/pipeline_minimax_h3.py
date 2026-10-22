@@ -1595,7 +1595,7 @@ class MiniMaxH3Pipeline(
         input_ids: torch.Tensor,
         vision_kwargs: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        if getattr(self, "_model_cpu_offload_modules", None) and component is not self.light_video_vae:
+        if getattr(self, "_model_cpu_offload_modules", None):
             # Invoke nn.Module.__call__ so the generic model-level offloader
             # swaps the resident DiT and encoder.
             return self.text_encoder(input_ids, **vision_kwargs)
@@ -1684,7 +1684,7 @@ class MiniMaxH3Pipeline(
 
     @contextmanager
     def _component_on_device(self, component: nn.Module):
-        if getattr(self, "_model_cpu_offload_modules", None):
+        if getattr(self, "_model_cpu_offload_modules", None) and component is not self.light_video_vae:
             # Sequential offload hooks whole modules (enable_omni_model_cpu_offload
             # registers them on the discovered components, e.g. the real
             # video_vae). Split-residency proxies carry no hook, so unwrap to the
