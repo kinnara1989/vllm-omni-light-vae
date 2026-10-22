@@ -1212,9 +1212,7 @@ class MiniMaxH3Pipeline(
             light_vae_path = getattr(od_config, "light_vae_path", None)
             if light_vae_path:
                 if not os.path.isfile(os.path.join(light_vae_path, "decode_config.json")):
-                    raise ValueError(
-                        f"--light-vae-path {light_vae_path!r} is missing decode_config.json"
-                    )
+                    raise ValueError(f"--light-vae-path {light_vae_path!r} is missing decode_config.json")
                 self.light_video_vae = MiniMaxH3LightVideoVAE(
                     light_vae_path,
                     device=self.device,
@@ -1229,10 +1227,8 @@ class MiniMaxH3Pipeline(
             # so it also decodes across the SP ranks instead of rank-locally.
             _pc = self.parallel_config
             self.light_video_vae.use_tiling = bool(getattr(od_config, "vae_use_tiling", False))
-            self.light_video_vae.set_parallel_size(
-                int(_pc.vae_patch_parallel_size), mode=_pc.vae_parallel_mode
-            )
-            
+            self.light_video_vae.set_parallel_size(int(_pc.vae_patch_parallel_size), mode=_pc.vae_parallel_mode)
+
         # Optional learned latent super-resolution, run between the denoise
         # loop and the VAE. Absent unless --additional-config names a
         # checkpoint, so a plain H3 deployment carries none of its weights.
