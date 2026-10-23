@@ -154,3 +154,64 @@ def test_light_vae_decode_failure_is_agreed_before_gather(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+def run_light_vae_tile_prep_failure_worker(rank, init_file):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        group = SimpleNamespace(device_group=dist.group.WORLD, cpu_group=dist.group.WORLD)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(vae_executor, "get_world_group", lambda: group)
+            executor = vae_executor.DistributedVaeExecutor()
+
+        vae = object.__new__(MiniMaxH3LightVideoVAE)
+        vae.distributed_executor = executor
+        vae._device_target = torch.device("cpu")
+        vae._profile_enabled = lambda: False
+        vae._profile_stamp = lambda enabled: 0.0
+        vae._window_balance_enabled = lambda: False
+        vae._tile_geometry = lambda latent_t, height, width: (1, 1, 0, 0)
+        vae._split_tiles = lambda total, tile, overlap: (([0, 1], [1, 1], [0]) if total > 1 else ([0], [1], [0]))
+        vae._stitch_tiles = lambda rows, y_ov, x_ov: rows[0][0]
+        vae._light_settings = {"image_context_tokens": 1, "image_context_output_phase": 0}
+        vae.is_distributed_enabled = lambda: True
+
+        model = SimpleNamespace(
+            spatial_compression_ratio=1,
+            tokens_chunk_size=1,
+            token_overlap=0,
+            frame_pre_padding=0,
+            use_tiling=True,
+            decoder=torch.nn.Linear(1, 1),
+            _decode_clip=lambda packed: packed,
+            _decode=lambda packed: packed,
+        )
+        vae.model = model
+
+        def fail_cat(*args, **kwargs):
+            raise torch.OutOfMemoryError("injected packing OOM")
+
+        z = torch.zeros(1, 1, 1, 2, 1)
+        with pytest.MonkeyPatch.context() as patch:
+            if rank == 1:
+                patch.setattr(torch, "cat", fail_cat)
+            with pytest.raises(torch.OutOfMemoryError, match="light VAE tile decode"):
+                vae._decode_video(z)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_light_vae_tile_prep_failure_is_agreed_before_collective(tmp_path):
+    torch.multiprocessing.spawn(
+        run_light_vae_tile_prep_failure_worker,
+        args=(str(tmp_path / "light-vae-prep-rendezvous"),),
+        nprocs=2,
+        join=True,
+    )
