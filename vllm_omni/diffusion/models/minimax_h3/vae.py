@@ -61,19 +61,16 @@ def _minimax_h3_keyframe_encode_context(
 
     # Deterministic cuDNN algorithms can still use reduced-precision TF32.
     # On Hopper, TF32 can shift the keyframe latent enough to push I2VA below
-    # the reference accuracy thresholds. Use FP32 deterministic convolutions
-    # for this sensitive CUDA encode only. MIOpen has no deterministic
-    # algorithm for the MI325 timeline-guide convolution, so applying the
-    # cuDNN policy on ROCm raises ``miopenStatusUnknownError``.
-    deterministic = current_omni_platform.is_cuda()
+    # the reference accuracy thresholds. Use FP32 convolutions for this
+    # sensitive encode only; preserve the existing math mode elsewhere.
     allow_tf32 = True
-    if deterministic:
+    if current_omni_platform.is_cuda():
         capability = current_omni_platform.get_device_capability(device.index or 0)
         allow_tf32 = capability is None or capability.major != 9
     with torch.backends.cudnn.flags(
         enabled=True,
         benchmark=False,
-        deterministic=deterministic,
+        deterministic=True,
         allow_tf32=allow_tf32,
     ):
         yield
@@ -1713,17 +1710,19 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
             if balanced is not None:
                 return balanced
         local = list(range(rank, n, size)) if distributed else list(range(n))
-        packed = torch.cat([tiles[i] for i in local], dim=0)
-        single = packed.shape[2] == 1
-        if single:
-            packed = packed.expand(-1, -1, int(self._light_settings["image_context_tokens"]), -1, -1).contiguous()
-        dtype = next(m.decoder.parameters()).dtype
-        packed = packed.to(dtype=dtype)
-        packed_done = self._profile_stamp(profile)
         prev = m.use_tiling
         m.use_tiling = False  # tiles are pre-cut; avoid a second spatial split
         try:
             with self._sync_decode_errors("light VAE tile decode", distributed):
+                packed = torch.cat([tiles[i] for i in local], dim=0)
+                single = packed.shape[2] == 1
+                if single:
+                    packed = packed.expand(
+                        -1, -1, int(self._light_settings["image_context_tokens"]), -1, -1
+                    ).contiguous()
+                dtype = next(m.decoder.parameters()).dtype
+                packed = packed.to(dtype=dtype)
+                packed_done = self._profile_stamp(profile)
                 if packed.shape[2] < m.tokens_chunk_size + m.token_overlap:
                     dec = m._decode_clip(packed)
                     start = (
