@@ -46,6 +46,52 @@ def test_light_vae_keeps_decode_contract():
     assert callable(getattr(MiniMaxH3LightVideoVAE, "offload_to_cpu", None))
 
 
+def _light_vae_for_decode(use_tiling):
+    calls = []
+
+    def decode_clip(z):
+        calls.append(tuple(z.shape))
+        return torch.zeros_like(z)
+
+    vae = object.__new__(MiniMaxH3LightVideoVAE)
+    vae.model = SimpleNamespace(
+        spatial_compression_ratio=1,
+        tokens_chunk_size=8,
+        token_overlap=0,
+        frame_pre_padding=0,
+        use_tiling=True,
+        decoder=torch.nn.Linear(1, 1),
+        _decode_clip=decode_clip,
+        _decode=decode_clip,
+    )
+    vae._device_target = torch.device("cpu")
+    vae.use_tiling = use_tiling
+    vae._tile_off = False
+    vae._tile_layout = "adaptive"
+    vae._tile_explicit = (2, 2, 0, 0)
+    vae._light_settings = {"image_context_tokens": 4, "image_context_output_phase": 0}
+    vae.is_distributed_enabled = lambda: False
+    return vae, calls
+
+
+@pytest.mark.parametrize(
+    ("use_tiling", "decoded_tiles", "decoded_tile_shape"),
+    [
+        (False, 1, (4, 6)),
+        (True, 6, (2, 2)),
+    ],
+)
+def test_light_vae_vae_use_tiling_controls_spatial_tiles(use_tiling, decoded_tiles, decoded_tile_shape):
+    vae, calls = _light_vae_for_decode(use_tiling)
+
+    output = vae._decode_video(torch.zeros(1, 2, 1, 4, 6))
+
+    assert output.shape == (1, 2, 1, 4, 6)
+    assert len(calls) == 1
+    assert calls[0][0] == decoded_tiles
+    assert calls[0][-2:] == decoded_tile_shape
+
+
 class _FakeDecoderVAE:
     decode_dtype = torch.float16
 

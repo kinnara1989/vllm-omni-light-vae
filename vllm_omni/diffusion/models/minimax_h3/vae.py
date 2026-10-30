@@ -1258,10 +1258,9 @@ class MiniMaxH3AudioVAE(nn.Module):
 def _light_vae_opt_enabled() -> bool:
     """Single switch for the Light VAE decode optimizations.
 
-    When enabled (default), the Light VAE applies its persistent weights,
-    8-rank window balancing and FP16 decoder-block weight materialization
-    together. Set ``MINIMAX_H3_LIGHT_VAE_OPT=0`` to run the Light VAE without
-    any of them (for A/B comparisons).
+    When enabled (default), the Light VAE keeps its weights resident and uses
+    8-rank window balancing. Set ``MINIMAX_H3_LIGHT_VAE_OPT=0`` to run the
+    Light VAE without either of them (for A/B comparisons).
     """
     return os.environ.get("MINIMAX_H3_LIGHT_VAE_OPT", "1").strip().lower() not in (
         "0",
@@ -1325,22 +1324,6 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
         # submodule to fp16. Otherwise a residual fp32 Conv3d such as
         # ``post_quant_conv`` would mix with the fp16 inputs.
         model.to(torch.float16)
-        # Persist the fp16 decoder-block Linear weights once so the fp16
-        # autocast decode stops re-casting fp32 weights on every call.
-        # Bit-exact vs the autocast path.
-        _fp16w = _light_vae_opt_enabled()
-        if _fp16w:
-            _blocks = getattr(getattr(model, "decoder", None), "transformer_blocks", None)
-            if isinstance(_blocks, torch.nn.ModuleList):
-                _n = 0
-                for _blk in _blocks:
-                    for _m in _blk.modules():
-                        if isinstance(_m, torch.nn.Linear):
-                            _m.weight.data = _m.weight.data.to(torch.float16)
-                            if _m.bias is not None:
-                                _m.bias.data = _m.bias.data.to(torch.float16)
-                            _n += 1
-                logger.info("MiniMax-H3 light VAE: materialized %d decoder-block Linear weights in fp16", _n)
         _attn_backend = os.environ.get("MINIMAX_H3_LIGHT_VAE_ATTN", "off").strip().lower()
         if _attn_backend and _attn_backend not in ("off", "none", "0", "native"):
             try:
@@ -1449,10 +1432,17 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
         ov = max(ov_short, ov_long)
         return short, short, ov, ov
 
+    def _spatial_plan(self, latent_t: int, height: int, width: int):
+        """Return the spatial tile grid, or one full-frame tile when disabled."""
+        if not self.use_tiling or self._tile_off:
+            return [0], [height], [], [0], [width], []
+        th, tw, oh, ow = self._tile_geometry(latent_t, height, width)
+        ys, hs, y_ov = self._split_tiles(height, th, oh)
+        xs, ws, x_ov = self._split_tiles(width, tw, ow)
+        return ys, hs, y_ov, xs, ws, x_ov
+
     def _split_tiles(self, length: int, size: int, overlap: int):
         m = self.model
-        if self._tile_off:
-            return [0], [length], []
         if self._tile_layout == "native" and self._tile_explicit is None:
             return m._split_tiles(length, size, overlap)
         # adaptive (trained LightX2V) splitter
@@ -1709,9 +1699,7 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
         ratio = int(m.spatial_compression_ratio)
         height = int(z.shape[-2]) * ratio
         width = int(z.shape[-1]) * ratio
-        th, tw, oh, ow = self._tile_geometry(int(z.shape[2]), height, width)
-        ys, hs, y_ov = self._split_tiles(height, th, oh)
-        xs, ws, x_ov = self._split_tiles(width, tw, ow)
+        ys, hs, y_ov, xs, ws, x_ov = self._spatial_plan(int(z.shape[2]), height, width)
         tiles = [
             z[..., y // ratio : y // ratio + h // ratio, x // ratio : x // ratio + w // ratio]
             for y, h in zip(ys, hs)
