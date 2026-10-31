@@ -170,6 +170,7 @@ def run_light_vae_tile_prep_failure_worker(rank, init_file):
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(vae_executor, "get_world_group", lambda: group)
             executor = vae_executor.DistributedVaeExecutor()
+        executor.set_parallel_size(2)
 
         vae = object.__new__(MiniMaxH3LightVideoVAE)
         vae.distributed_executor = executor

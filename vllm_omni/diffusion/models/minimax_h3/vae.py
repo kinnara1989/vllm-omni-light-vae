@@ -1530,6 +1530,36 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
             out_y += row_heights[i]
         return canvas
 
+    def _stitch_gathered(self, gathered, ys, xs, y_ov, x_ov):
+        rows = [[gathered[i * len(xs) + j] for j in range(len(xs))] for i in range(len(ys))]
+        return self._stitch_tiles(rows, y_ov, x_ov)
+
+    def _decode_parallel_state(self):
+        """Resolve the configured VAE degree and the group that decodes."""
+        world_group = self.distributed_executor.group
+        world_size = dist.get_world_size(world_group)
+        configured = int(getattr(self.distributed_executor, "parallel_size", 1) or 1)
+        size = min(max(configured, 1), world_size)
+        if size <= 1 or size >= world_size:
+            return world_group, size, world_group, world_size, dist.get_rank(world_group)
+        group = getattr(self, "_decode_group", None)
+        if group is None:
+            group = dist.new_group(ranks=list(range(size)))
+            self._decode_group = group
+        return group, size, world_group, world_size, dist.get_rank(group)
+
+    def _broadcast_decoded_video(self, output, world_group):
+        """Share the stitched video from decode rank 0 with idle ranks."""
+        shape = torch.zeros(5, dtype=torch.int64, device=self._device_target)
+        if output is not None:
+            shape[: output.ndim] = torch.tensor(output.shape, dtype=torch.int64, device=self._device_target)
+        dist.broadcast(shape, src=0, group=world_group)
+        if output is None:
+            dtype = next(self.model.decoder.parameters()).dtype
+            output = torch.empty(tuple(shape.tolist()), dtype=dtype, device=self._device_target)
+        dist.broadcast(output, src=0, group=world_group)
+        return output
+
     def _gather_tiles(self, dec, local, n, group):
         size = dist.get_world_size(group)
         counts = [len(range(r, n, size)) for r in range(size)]
@@ -1743,48 +1773,69 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
             for x, w in zip(xs, ws)
         ]
         n = len(tiles)
-        group, size, rank = None, 1, 0
+        group, size, world_group, world_size, rank = None, 1, None, 1, 0
         if self.is_distributed_enabled():
-            group = self.distributed_executor.group
-            size = dist.get_world_size(group)
-            rank = dist.get_rank(group)
+            group, size, world_group, world_size, rank = self._decode_parallel_state()
         distributed = group is not None and size > 1 and n >= size
-        if distributed and self._window_balance_enabled() and int(z.shape[2]) >= m.tokens_chunk_size + m.token_overlap:
+        if (
+            distributed
+            and size == world_size
+            and self._window_balance_enabled()
+            and int(z.shape[2]) >= m.tokens_chunk_size + m.token_overlap
+        ):
             balanced = self._decode_video_balanced(z, ys, hs, y_ov, xs, ws, x_ov, group, size, rank, profile, started)
             if balanced is not None:
                 return balanced
-        local = list(range(rank, n, size)) if distributed else list(range(n))
+        if not distributed:
+            local = list(range(n))
+        elif rank >= 0:
+            local = list(range(rank, n, size))
+        else:
+            local = []
+        packed = None
+        dec = None
         prev = m.use_tiling
         m.use_tiling = False  # tiles are pre-cut; avoid a second spatial split
         try:
             with self._sync_decode_errors("light VAE tile decode", distributed):
-                packed = torch.cat([tiles[i] for i in local], dim=0)
-                single = packed.shape[2] == 1
-                if single:
-                    packed = packed.expand(
-                        -1, -1, int(self._light_settings["image_context_tokens"]), -1, -1
-                    ).contiguous()
-                dtype = next(m.decoder.parameters()).dtype
-                packed = packed.to(dtype=dtype)
+                if local:
+                    packed = torch.cat([tiles[i] for i in local], dim=0)
+                    single = packed.shape[2] == 1
+                    if single:
+                        packed = packed.expand(
+                            -1, -1, int(self._light_settings["image_context_tokens"]), -1, -1
+                        ).contiguous()
+                    dtype = next(m.decoder.parameters()).dtype
+                    packed = packed.to(dtype=dtype)
+                    if packed.shape[2] < m.tokens_chunk_size + m.token_overlap:
+                        dec = m._decode_clip(packed)
+                        start = (
+                            int(self._light_settings["image_context_output_phase"])
+                            if single
+                            else int(m.frame_pre_padding)
+                        )
+                        dec = dec[:, :, start : start + 1] if single else dec[:, :, start:]
+                    else:
+                        dec = m._decode(packed)
                 packed_done = self._profile_stamp(profile)
-                if packed.shape[2] < m.tokens_chunk_size + m.token_overlap:
-                    dec = m._decode_clip(packed)
-                    start = (
-                        int(self._light_settings["image_context_output_phase"]) if single else int(m.frame_pre_padding)
-                    )
-                    dec = dec[:, :, start : start + 1] if single else dec[:, :, start:]
-                else:
-                    dec = m._decode(packed)
         finally:
             m.use_tiling = prev
         decoder_done = self._profile_stamp(profile)
         if distributed:
-            gathered = self._gather_tiles(dec, local, n, group)
+            if rank >= 0:
+                gathered = self._gather_tiles(dec, local, n, group)
+            else:
+                with self.distributed_executor.sync_errors("light VAE tile gather allocation"):
+                    pass
+                gathered = None
         else:
             gathered = list(dec.split(1, dim=0))
         gather_done = self._profile_stamp(profile)
-        rows = [[gathered[i * len(xs) + j] for j in range(len(xs))] for i in range(len(ys))]
-        output = self._stitch_tiles(rows, y_ov, x_ov)
+        if distributed and size < world_size:
+            output = self._stitch_gathered(gathered, ys, xs, y_ov, x_ov) if gathered is not None else None
+            output = self._broadcast_decoded_video(output, world_group)
+        else:
+            output = self._stitch_gathered(gathered, ys, xs, y_ov, x_ov)
         stitch_done = self._profile_stamp(profile)
         if profile:
             self._last_decode_profile = {
@@ -1794,7 +1845,7 @@ class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
                 "output_shape_fp16": list(output.shape),
                 "tiles": n,
                 "local_tiles": len(local),
-                "decoder_batch": int(packed.shape[0]),
+                "decoder_batch": int(packed.shape[0]) if packed is not None else 0,
                 "split_pack_ms": (packed_done - started) * 1000,
                 "decoder_ms": (decoder_done - packed_done) * 1000,
                 "gather_ms": (gather_done - decoder_done) * 1000,

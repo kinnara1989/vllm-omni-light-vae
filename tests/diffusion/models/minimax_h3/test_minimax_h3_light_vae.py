@@ -46,6 +46,50 @@ def test_light_vae_keeps_decode_contract():
     assert callable(getattr(MiniMaxH3LightVideoVAE, "offload_to_cpu", None))
 
 
+@pytest.mark.parametrize(
+    ("parallel_size", "world_rank", "expected_rank", "expected_ranks"),
+    [
+        (2, 0, 0, [0, 1]),
+        (2, 3, -1, [0, 1]),
+        (8, 3, 3, None),
+    ],
+)
+def test_light_vae_decode_uses_configured_parallel_size(
+    monkeypatch, parallel_size, world_rank, expected_rank, expected_ranks
+):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    world_group = object()
+    created = []
+
+    def new_group(ranks):
+        group = SimpleNamespace(ranks=ranks)
+        created.append(group)
+        return group
+
+    def get_world_size(group):
+        return len(group.ranks) if group in created else 8
+
+    def get_rank(group):
+        return world_rank if group is world_group else (0 if world_rank < parallel_size else -1)
+
+    monkeypatch.setattr(vae_module.dist, "get_world_size", get_world_size)
+    monkeypatch.setattr(vae_module.dist, "new_group", new_group)
+    monkeypatch.setattr(vae_module.dist, "get_rank", get_rank)
+
+    vae = object.__new__(MiniMaxH3LightVideoVAE)
+    vae.distributed_executor = SimpleNamespace(group=world_group, parallel_size=parallel_size)
+
+    group, size, resolved_world, world_size, rank = vae._decode_parallel_state()
+
+    assert size == parallel_size
+    assert resolved_world is world_group
+    assert world_size == 8
+    assert rank == expected_rank
+    assert [g.ranks for g in created] == ([expected_ranks] if expected_ranks else [])
+    assert group is (created[0] if created else world_group)
+
+
 def _light_vae_for_decode(use_tiling):
     calls = []
 
